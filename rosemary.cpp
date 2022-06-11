@@ -1,3 +1,15 @@
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
+
 #include <string> 
 #include <cctype>
 #include <cstdio>
@@ -41,7 +53,7 @@ static int get_tok() {
     }
 
     if (std::isdigit(last_char)) {
-        bool dec_flag; 
+        bool dec_flag = false; 
         std::string num_str(1, last_char);
 
         while (std::isdigit(last_char = std::getchar()) || (last_char == '.' && !dec_flag)) {
@@ -76,7 +88,8 @@ static int get_tok() {
 
 class ExprAST {
 public:
-    virtual ~ExprAST() {}
+    virtual ~ExprAST() = default; 
+    virtual llvm::Value* codegen() = 0; 
 };
 
 class NumberExprAST : public ExprAST {
@@ -85,6 +98,8 @@ private:
 public: 
     NumberExprAST(double val)
     : val(val) {}
+
+    llvm::Value* codegen() override; 
 };
 
 class VariableExprAST : public ExprAST {
@@ -93,6 +108,8 @@ private:
 public: 
     VariableExprAST(std::string name) 
     : name(name) {}
+
+    llvm::Value* codegen() override; 
 };
 
 class BinaryExprAST : public ExprAST {
@@ -103,9 +120,11 @@ private:
 public:
     BinaryExprAST(char op, std::unique_ptr<ExprAST> lhs, std::unique_ptr<ExprAST> rhs)
     : op(op), lhs(std::move(lhs)), rhs(std::move(rhs)) {}
+
+    llvm::Value* codegen() override; 
 };
 
-class CallExprAST: public ExprAST {
+class CallExprAST : public ExprAST {
 private:
     std::string callee;
     std::vector< std::unique_ptr<ExprAST> > args; 
@@ -113,6 +132,8 @@ private:
 public:
     CallExprAST(std::string callee, std::vector< std::unique_ptr<ExprAST> > args) 
     : callee(callee), args(std::move(args)) {}
+
+    llvm::Value* codegen() override; 
 };
 
 class PrototypeAST {
@@ -153,7 +174,7 @@ static std::unordered_map<char, int> binop_precedence = {
 };
 
 static std::unique_ptr<ExprAST> log_error(const char* str) {
-    std::fprintf(stderr, "log_error: %s\n", str);
+    std::fprintf(stderr, "Error: %s\n", str);
     return nullptr; 
 }
 
@@ -183,7 +204,7 @@ static std::unique_ptr<ExprAST> parse_paren_expr() {
 
     auto inner = parse_expression();
     if (!inner) return nullptr; 
-    if (cur_tok != ')') return log_error("expected ')'");
+    if (cur_tok != ')') return log_error("Expected ')'");
     
     get_next_tok(); // Eat the ')'.
     return inner; 
@@ -221,7 +242,7 @@ static std::unique_ptr<ExprAST> parse_primary() {
         case Token::tok_identifier: return parse_identifier_expr();
         case Token::tok_number: return parse_number_expr();
         case '(': return parse_paren_expr();
-        default: return log_error("unknown token when expecting an expression");
+        default: return log_error("Unknown token when expecting an expression");
     }
 }
 
@@ -353,6 +374,66 @@ static void main_loop() {
                 break; 
         }
     }
+}
+
+//------------------------------------------------------------------------------------------------//
+// Code Generation
+//------------------------------------------------------------------------------------------------//
+
+static std::unique_ptr<llvm::LLVMContext> the_context; 
+static std::unique_ptr< llvm::IRBuilder<> > builder;  
+static std::unique_ptr<llvm::Module> the_module;
+static std::map<std::string, llvm::Value*> named_values; 
+
+llvm::Value* log_error_v(const char* str) {
+    log_error(str);
+    return nullptr; 
+}
+
+llvm::Value* NumberExprAST::codegen() {
+    return llvm::ConstantFP::get(*the_context, llvm::APFloat(val));
+}
+
+llvm::Value* VariableExprAST::codegen() {
+    llvm::Value* v = named_values[name];
+    if (!v) log_error_v("Unknown variable name");
+    return v; 
+}
+
+llvm::Value* BinaryExprAST::codegen() {
+    llvm::Value* left = lhs->codegen();
+    llvm::Value* right = rhs->codegen();
+
+    if (!left || !right) return nullptr; 
+
+    switch (op) {
+        case '+':
+            return builder->CreateFAdd(left, right, "addtmp");
+        case '-':
+            return builder->CreateFSub(left, right, "subtmp");
+        case '*':
+            return builder->CreateFMul(left, right, "multmp");
+        case '<':
+            left = builder->CreateFCmpULT(left, right, "cmptmp");
+            return builder->CreateUIToFP(left, llvm::Type::getDoubleTy(*the_context), "booltmp");
+        default:
+            return log_error_v("Invalid binary operator");
+    }
+}
+
+llvm::Value* CallExprAST::codegen() {
+    llvm::Function* callee_f = the_module->getFunction(callee);
+
+    if (!callee_f) return log_error_v("Unknown function reference");
+    if (callee_f->arg_size() != args.size()) return log_error_v("Incorrect number of arguments");
+
+    std::vector<llvm::Value*> args_v; 
+    for (unsigned i = 0; i != args.size(); ++i) {
+        args_v.push_back(args[i]->codegen());
+        if (!args_v.back()) return nullptr; 
+    }
+
+    return builder->CreateCall(callee_f, args_v, "calltmp");
 }
 
 //------------------------------------------------------------------------------------------------//
