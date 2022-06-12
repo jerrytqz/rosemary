@@ -145,6 +145,8 @@ public:
     : name(name), args(std::move(args)) {}
 
     const std::string& get_name() const { return name; }
+
+    llvm::Function* codegen();
 };
 
 class FunctionAST {
@@ -155,6 +157,8 @@ private:
 public:
     FunctionAST(std::unique_ptr<PrototypeAST> proto, std::unique_ptr<ExprAST> body) 
     : proto(std::move(proto)), body(std::move(body)) {}
+
+    llvm::Function* codegen();
 };
 
 //------------------------------------------------------------------------------------------------//
@@ -327,56 +331,6 @@ static std::unique_ptr<FunctionAST> parse_top_level_expr() {
 }
 
 //------------------------------------------------------------------------------------------------//
-// Top-Level Parsing
-//------------------------------------------------------------------------------------------------//
-
-static void handle_definition() {
-    if (parse_definition()) {
-        fprintf(stderr, "Parsed a function definition.\n");
-    } else {
-        get_next_tok(); // Eat the token for error recovery. 
-    }
-}
-
-static void handle_extern() {
-    if (parse_extern()) {
-        fprintf(stderr, "Parsed an extern.\n");
-    } else {
-        get_next_tok(); // Eat the token for error recovery.
-    }
-}
-
-static void handle_top_level_expression() {
-    if (parse_top_level_expr()) {
-        fprintf(stderr, "Parsed a top-level expression.\n");
-    } else {
-        get_next_tok(); // Eat the token for error recovery.
-    }
-}
-
-static void main_loop() {
-    while (true) {
-        std::fprintf(stderr, ">> ");
-        switch (cur_tok) {
-            case Token::tok_eof:
-                return; 
-            case ';':
-                get_next_tok(); // Eat the ';'.
-                break;
-            case Token::tok_def:
-                handle_definition();
-                break;
-            case Token::tok_extern:
-                handle_extern();
-                break;
-            default:
-                handle_top_level_expression();
-                break; 
-        }
-    }
-}
-
-//------------------------------------------------------------------------------------------------//
 // Code Generation
 //------------------------------------------------------------------------------------------------//
 
@@ -436,15 +390,139 @@ llvm::Value* CallExprAST::codegen() {
     return builder->CreateCall(callee_f, args_v, "calltmp");
 }
 
+llvm::Function* PrototypeAST::codegen() {
+    std::vector<llvm::Type*> doubles(args.size(), llvm::Type::getDoubleTy(*the_context));
+
+    llvm::FunctionType* ft = llvm::FunctionType::get(
+        llvm::Type::getDoubleTy(*the_context), 
+        doubles, 
+        false
+    );
+
+    llvm::Function* f = llvm::Function::Create(
+        ft, 
+        llvm::Function::ExternalLinkage,
+        name, 
+        the_module.get()
+    );
+
+    // Name arguments 
+    unsigned idx = 0;
+    for (auto& arg : f->args()) arg.setName(args[idx++]);
+
+
+    return f; 
+}
+
+llvm::Function* FunctionAST::codegen() {
+    llvm::Function* the_function = the_module->getFunction(proto->get_name());
+
+    if (!the_function) the_function = proto->codegen();
+
+    if (!the_function) return nullptr; 
+
+    if (!the_function->empty()) return (llvm::Function*)log_error_v("Redefinition of function.");
+
+    llvm::BasicBlock* bb = llvm::BasicBlock::Create(*the_context, "entry", the_function);
+    builder->SetInsertPoint(bb);
+
+    named_values.clear();
+    for (auto& arg : the_function->args()) named_values[arg.getName()] = &arg;
+
+    if (llvm::Value* ret_val = body->codegen()) {
+        builder->CreateRet(ret_val);
+        llvm::verifyFunction(*the_function);
+        return the_function; 
+    }
+
+    the_function->eraseFromParent();
+    return nullptr; 
+}
+
 //------------------------------------------------------------------------------------------------//
-// Driver 
+// Top-Level Parsing & JIT Driver
+//------------------------------------------------------------------------------------------------//
+
+static void initialize_module() {
+    the_context = std::make_unique<llvm::LLVMContext>();
+    the_module = std::make_unique<llvm::Module>("Rosemary JIT", *the_context);
+    builder = std::make_unique< llvm::IRBuilder<> >(*the_context);
+}
+
+static void handle_definition() {
+    if (auto fn_ast = parse_definition()) {
+        if (auto* fn_ir = fn_ast->codegen()) {
+            fprintf(stderr, "Read function definition:\n");
+            fn_ir->print(llvm::errs());
+            fprintf(stderr, "\n");
+        }
+    } else {
+        get_next_tok(); // Eat the token for error recovery. 
+    }
+}
+
+static void handle_extern() {
+    if (auto proto_ast = parse_extern()) {
+        if (auto* fn_ir = proto_ast->codegen()) {
+            fprintf(stderr, "Read extern:\n");
+            fn_ir->print(llvm::errs());
+            fprintf(stderr, "\n");
+        }
+    } else {
+        get_next_tok(); // Eat the token for error recovery.
+    }
+}
+
+static void handle_top_level_expression() {
+    if (auto fn_ast = parse_top_level_expr()) {
+        if (auto* fn_ir = fn_ast->codegen()) {
+            fprintf(stderr, "Read top-level expression:\n");
+            fn_ir->print(llvm::errs());
+            fprintf(stderr, "\n");
+
+            // Remove anonymous function. 
+            fn_ir->eraseFromParent();
+        }
+    } else {
+        get_next_tok(); // Eat the token for error recovery.
+    }
+}
+
+static void main_loop() {
+    while (true) {
+        switch (cur_tok) {
+            case Token::tok_eof:
+                return; 
+            case ';':
+                std::fprintf(stderr, ">> ");
+                get_next_tok(); // Eat the ';'.
+                break;
+            case Token::tok_def:
+                handle_definition();
+                break;
+            case Token::tok_extern:
+                handle_extern();
+                break;
+            default:
+                handle_top_level_expression();
+                break; 
+        }
+    }
+}
+
+//------------------------------------------------------------------------------------------------//
+// Main Driver 
 //------------------------------------------------------------------------------------------------//
 
 int main() {
     fprintf(stderr, ">> ");
     get_next_tok();
 
+    initialize_module();
+
     main_loop();
+
+    the_module->print(llvm::errs(), nullptr);
 
     return 0; 
 }
