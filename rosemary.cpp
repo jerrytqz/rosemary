@@ -1,3 +1,4 @@
+#include "KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -6,13 +7,20 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 
 #include <string> 
 #include <cctype>
 #include <cstdio>
+#include <cassert>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -33,6 +41,8 @@ enum Token {
 static const std::string DEF_KEY = "def";
 static const std::string EXTERN_KEY = "extern";
 static const char COMMENT_KEY = '#';
+
+static const std::string ANON_FUNC_NAME = "__anon_expr"; 
 
 static std::string identifier_str;
 static double num_val; 
@@ -145,6 +155,8 @@ public:
     : name(name), args(std::move(args)) {}
 
     const std::string& get_name() const { return name; }
+    const unsigned get_args_size() const { return args.size(); }
+    const std::string& get_arg(int index) const { return args[index]; }
 
     llvm::Function* codegen();
 };
@@ -199,7 +211,7 @@ static std::unique_ptr<ExprAST> parse_expression();
 
 static std::unique_ptr<ExprAST> parse_number_expr() {
     auto result = std::make_unique<NumberExprAST>(num_val);
-    get_next_tok(); // Eat the number. 
+    get_next_tok(); // Eat the number.
     return std::move(result);
 }
 
@@ -219,8 +231,10 @@ static std::unique_ptr<ExprAST> parse_identifier_expr() {
 
     get_next_tok(); // Eat the identifier.
 
+    // Variable reference. 
     if (cur_tok != '(') return std::make_unique<VariableExprAST>(id);
 
+    // Function call. 
     get_next_tok(); // Eat the '('.
 
     std::vector< std::unique_ptr<ExprAST> > args; 
@@ -324,7 +338,7 @@ static std::unique_ptr<PrototypeAST> parse_extern() {
 
 static std::unique_ptr<FunctionAST> parse_top_level_expr() {
     if (auto e = parse_expression()) {
-        auto proto = std::make_unique<PrototypeAST>("", std::vector<std::string>());
+        auto proto = std::make_unique<PrototypeAST>(ANON_FUNC_NAME, std::vector<std::string>());
         return std::make_unique<FunctionAST>(std::move(proto), std::move(e));
     }
     return nullptr; 
@@ -337,7 +351,19 @@ static std::unique_ptr<FunctionAST> parse_top_level_expr() {
 static std::unique_ptr<llvm::LLVMContext> the_context; 
 static std::unique_ptr< llvm::IRBuilder<> > builder;  
 static std::unique_ptr<llvm::Module> the_module;
+static std::unique_ptr<llvm::legacy::FunctionPassManager> the_fpm; 
 static std::map<std::string, llvm::Value*> named_values; 
+static std::map< std::string, std::unique_ptr<PrototypeAST> > function_protos; 
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT> the_jit;
+
+llvm::Function* get_function(std::string name) {
+    if (auto* f = the_module->getFunction(name)) return f; 
+
+    auto fi = function_protos.find(name);
+    if (fi != function_protos.end()) return fi->second->codegen();
+
+    return nullptr; 
+}
 
 llvm::Value* log_error_v(const char* str) {
     log_error(str);
@@ -376,14 +402,16 @@ llvm::Value* BinaryExprAST::codegen() {
 }
 
 llvm::Value* CallExprAST::codegen() {
-    llvm::Function* callee_f = the_module->getFunction(callee);
+    llvm::Function* callee_f = get_function(callee);
 
     if (!callee_f) return log_error_v("Unknown function reference");
-    if (callee_f->arg_size() != args.size()) return log_error_v("Incorrect number of arguments");
+    if (callee_f->arg_size() != this->args.size()) {
+        return log_error_v("Incorrect number of arguments");
+    }
 
     std::vector<llvm::Value*> args_v; 
-    for (unsigned i = 0; i != args.size(); ++i) {
-        args_v.push_back(args[i]->codegen());
+    for (unsigned i = 0; i != this->args.size(); ++i) {
+        args_v.push_back(this->args[i]->codegen());
         if (!args_v.back()) return nullptr; 
     }
 
@@ -391,7 +419,7 @@ llvm::Value* CallExprAST::codegen() {
 }
 
 llvm::Function* PrototypeAST::codegen() {
-    std::vector<llvm::Type*> doubles(args.size(), llvm::Type::getDoubleTy(*the_context));
+    std::vector<llvm::Type*> doubles(this->args.size(), llvm::Type::getDoubleTy(*the_context));
 
     llvm::FunctionType* ft = llvm::FunctionType::get(
         llvm::Type::getDoubleTy(*the_context), 
@@ -408,33 +436,33 @@ llvm::Function* PrototypeAST::codegen() {
 
     // Name arguments 
     unsigned idx = 0;
-    for (auto& arg : f->args()) arg.setName(args[idx++]);
-
+    for (auto& arg : f->args()) arg.setName(this->args[idx++]);
 
     return f; 
 }
 
 llvm::Function* FunctionAST::codegen() {
-    llvm::Function* the_function = the_module->getFunction(proto->get_name());
-
-    if (!the_function) the_function = proto->codegen();
-
+    auto& p = *proto; 
+    function_protos[proto->get_name()] = std::move(proto);
+    llvm::Function* the_function = get_function(p.get_name());
     if (!the_function) return nullptr; 
-
-    if (!the_function->empty()) return (llvm::Function*)log_error_v("Redefinition of function.");
 
     llvm::BasicBlock* bb = llvm::BasicBlock::Create(*the_context, "entry", the_function);
     builder->SetInsertPoint(bb);
 
+    // Prepare for codegen.
     named_values.clear();
     for (auto& arg : the_function->args()) named_values[arg.getName()] = &arg;
 
+    // Codegen body. 
     if (llvm::Value* ret_val = body->codegen()) {
         builder->CreateRet(ret_val);
         llvm::verifyFunction(*the_function);
+        the_fpm->run(*the_function);
         return the_function; 
     }
 
+    // Error in codegen. 
     the_function->eraseFromParent();
     return nullptr; 
 }
@@ -443,18 +471,30 @@ llvm::Function* FunctionAST::codegen() {
 // Top-Level Parsing & JIT Driver
 //------------------------------------------------------------------------------------------------//
 
-static void initialize_module() {
+static void initialize_module_and_pass_manager(void) {
     the_context = std::make_unique<llvm::LLVMContext>();
+
     the_module = std::make_unique<llvm::Module>("Rosemary JIT", *the_context);
+    the_module->setDataLayout(the_jit->getTargetMachine().createDataLayout());
+
+    the_fpm = std::make_unique<llvm::legacy::FunctionPassManager>(the_module.get());
+    the_fpm->add(llvm::createInstructionCombiningPass());
+    the_fpm->add(llvm::createReassociatePass());
+    the_fpm->add(llvm::createGVNPass());
+    the_fpm->add(llvm::createCFGSimplificationPass());
+    the_fpm->doInitialization();
+
     builder = std::make_unique< llvm::IRBuilder<> >(*the_context);
 }
 
 static void handle_definition() {
     if (auto fn_ast = parse_definition()) {
         if (auto* fn_ir = fn_ast->codegen()) {
-            fprintf(stderr, "Read function definition:\n");
-            fn_ir->print(llvm::errs());
-            fprintf(stderr, "\n");
+            // fprintf(stderr, "Read function definition:\n");
+            // fn_ir->print(llvm::errs());
+            // fprintf(stderr, "\n");
+            the_jit->addModule(std::move(the_module));
+            initialize_module_and_pass_manager();
         }
     } else {
         get_next_tok(); // Eat the token for error recovery. 
@@ -464,9 +504,10 @@ static void handle_definition() {
 static void handle_extern() {
     if (auto proto_ast = parse_extern()) {
         if (auto* fn_ir = proto_ast->codegen()) {
-            fprintf(stderr, "Read extern:\n");
-            fn_ir->print(llvm::errs());
-            fprintf(stderr, "\n");
+            // fprintf(stderr, "Read extern:\n");
+            // fn_ir->print(llvm::errs());
+            // fprintf(stderr, "\n");
+            function_protos[proto_ast->get_name()] = std::move(proto_ast); 
         }
     } else {
         get_next_tok(); // Eat the token for error recovery.
@@ -476,12 +517,20 @@ static void handle_extern() {
 static void handle_top_level_expression() {
     if (auto fn_ast = parse_top_level_expr()) {
         if (auto* fn_ir = fn_ast->codegen()) {
-            fprintf(stderr, "Read top-level expression:\n");
-            fn_ir->print(llvm::errs());
-            fprintf(stderr, "\n");
+            // fprintf(stderr, "Read top-level expression:\n");
+            // fn_ir->print(llvm::errs());
+            // fprintf(stderr, "\n");
 
-            // Remove anonymous function. 
-            fn_ir->eraseFromParent();
+            auto h = the_jit->addModule(std::move(the_module));
+            initialize_module_and_pass_manager();
+
+            auto expr_symbol = the_jit->findSymbol(ANON_FUNC_NAME);
+            assert(expr_symbol && "Function not found");
+
+            double (*fp)() = (double (*)())(intptr_t)llvm::cantFail(expr_symbol.getAddress());
+            fprintf(stderr, "Evaluated to %f\n", (*fp)());
+
+            the_jit->removeModule(h);
         }
     } else {
         get_next_tok(); // Eat the token for error recovery.
@@ -515,10 +564,15 @@ static void main_loop() {
 //------------------------------------------------------------------------------------------------//
 
 int main() {
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+    llvm::InitializeNativeTargetAsmParser();
+
     fprintf(stderr, ">> ");
     get_next_tok();
 
-    initialize_module();
+    the_jit = std::make_unique<llvm::orc::KaleidoscopeJIT>();
+    initialize_module_and_pass_manager();
 
     main_loop();
 
