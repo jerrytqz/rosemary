@@ -47,7 +47,7 @@ static const std::string ANON_FUNC_NAME = "__anon_expr";
 static std::string identifier_str;
 static double num_val; 
 
-static int get_tok() {
+static int gettok() {
     static int last_char = ' ';
 
     while (std::isspace(last_char)) last_char = std::getchar();
@@ -80,7 +80,7 @@ static int get_tok() {
         while (last_char != EOF && last_char != '\n' && last_char != '\r') {
             last_char = std::getchar(); 
         }
-        if (last_char != EOF) return get_tok(); 
+        if (last_char != EOF) return gettok(); 
     }
 
     if (last_char == EOF) {
@@ -179,7 +179,7 @@ public:
 
 static int cur_tok;
 static int get_next_tok() {
-    return cur_tok = get_tok();
+    return cur_tok = gettok();
 }
 
 static std::unordered_map<char, int> binop_precedence = {
@@ -199,7 +199,7 @@ static std::unique_ptr<PrototypeAST> log_error_p(const char* str) {
     return nullptr; 
 }
 
-static int get_tok_precedence() {
+static int gettok_precedence() {
     if (!std::isprint(cur_tok)) return -1; 
 
     int tok_prec = binop_precedence[cur_tok];
@@ -266,7 +266,7 @@ static std::unique_ptr<ExprAST> parse_primary() {
 
 static std::unique_ptr<ExprAST> parse_bin_op_rhs(int expr_prec, std::unique_ptr<ExprAST> lhs) {
     while (true) {
-        int tok_prec = get_tok_precedence();
+        int tok_prec = gettok_precedence();
         // Acts as termination for base function call, otherwise terminates when rhs is fully
         // formed. Call this if statement *. 
         if (tok_prec < expr_prec) return lhs; 
@@ -279,7 +279,7 @@ static std::unique_ptr<ExprAST> parse_bin_op_rhs(int expr_prec, std::unique_ptr<
         if (!rhs) return nullptr; 
 
         // Make node now? First check if next bin_op has higher precedence. 
-        int next_prec = get_tok_precedence();
+        int next_prec = gettok_precedence();
         if (tok_prec < next_prec) {
             // Continue forming rhs until *. 
             rhs = parse_bin_op_rhs(tok_prec + 1, std::move(rhs));
@@ -434,7 +434,7 @@ llvm::Function* PrototypeAST::codegen() {
         the_module.get()
     );
 
-    // Name arguments 
+    // Name arguments.
     unsigned idx = 0;
     for (auto& arg : f->args()) arg.setName(this->args[idx++]);
 
@@ -568,6 +568,7 @@ int main() {
     llvm::InitializeNativeTargetAsmPrinter();
     llvm::InitializeNativeTargetAsmParser();
 
+    fprintf(stderr, "Rosemary 1.0.0\n");
     fprintf(stderr, ">> ");
     get_next_tok();
 
