@@ -42,8 +42,6 @@ static const std::string DEF_KEY = "def";
 static const std::string EXTERN_KEY = "extern";
 static const char COMMENT_KEY = '#';
 
-static const std::string ANON_FUNC_NAME = "__anon_expr"; 
-
 static std::string identifier_str;
 static double num_val; 
 
@@ -155,8 +153,6 @@ public:
     : name(name), args(std::move(args)) {}
 
     const std::string& get_name() const { return name; }
-    const unsigned get_args_size() const { return args.size(); }
-    const std::string& get_arg(int index) const { return args[index]; }
 
     llvm::Function* codegen();
 };
@@ -176,6 +172,8 @@ public:
 //------------------------------------------------------------------------------------------------//
 // Parser
 //------------------------------------------------------------------------------------------------//
+
+static const std::string ANON_FUNC_NAME = "__anon_expr"; 
 
 static int cur_tok;
 static int get_next_tok() {
@@ -383,7 +381,7 @@ llvm::Value* VariableExprAST::codegen() {
 llvm::Value* BinaryExprAST::codegen() {
     llvm::Value* left = lhs->codegen();
     llvm::Value* right = rhs->codegen();
-
+    
     if (!left || !right) return nullptr; 
 
     switch (op) {
